@@ -1,0 +1,462 @@
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+from tabulate import tabulate
+import gradio as gr
+import io
+import os
+
+# =================================================================
+# 1. IGBT 資料庫 (動態參數偏移邏輯)
+# =================================================================
+# v_slope: Vth 隨輸入電壓偏移的斜率 (V/V)
+# r_slope: Ron 隨輸入電壓偏移的斜率 (Ω/V)
+IGBT_DB = {
+    "T121": {
+        "Ron_base": 0.323, "Vth_base": 0.576,
+        "v_slope": 0.0058, "r_slope": -0.0081
+    },
+    "J121": {
+        "Ron_base": 0.423, "Vth_base": 0.708,
+        "v_slope": 0.0058, "r_slope": -0.0081
+    }
+}
+
+# =================================================================
+# 2. 鐵芯物理特性資料庫 (Core Characteristics DB)
+# =================================================================
+CORE_DB = {
+    "J3_Core": {
+        "ref_ni": [504, 772, 980, 1036, 1075],
+        "ref_mu_scale": [1.0, 0.82, 0.62, 0.61, 0.58],
+        "base_n2": 13012,
+        "description": "J3 Core: Standard ignition coil core."
+    },
+    "SE35S_SE39S_Core": {
+        "ref_ni": [240, 480, 720, 960, 1200],
+        "ref_mu_scale": [1.0, 1.0, 0.856, 0.651, 0.450],
+        "base_n2": 21000,
+        "description": "SE35S/SE39S Core: Standard ignition coil core."
+    }
+}
+
+# =================================================================
+# 3. 機種預設資料庫 (Presets Database)
+# =================================================================
+# V11.1 Update: Renamed 'applied_gain' to 'K_struct'
+PRESETS = {
+    "J3": {
+        "primary_turns": 280, "primary_cu_diameter_mm": 0.35, "primary_insulation_mm": 0.01,
+        "secondary_turns": 13012, "secondary_cu_diameter_mm": 0.05, "secondary_insulation_mm": 0.004,
+        "primary_bobbin_diameter_mm": 16.0, "primary_bobbin_length_mm": 24.0, "secondary_bobbin_diameter_mm": 23.0,
+        "secondary_slot_widths_string": "1.0, 1.0, 2.4, 2.4, 2.4, 2.4, 2.4, 2.4, 2.4, 1.0",
+        "core_length_mm": 30.0, "core_area_mm2": 80.0, "core_mu_r_eff": 20.93,
+        "coupling_factor_k": 0.95, "secondary_packing_factor": 0.85, "secondary_length_buffer": 1.05,
+        "fixed_cutoff_us": 25.0,
+        "applied_core": "J3_Core", "K_struct": 3.26
+    },
+    "SE35S": {
+        "primary_turns": 240, "primary_cu_diameter_mm": 0.35, "primary_insulation_mm": 0.01,
+        "secondary_turns": 21000, "secondary_cu_diameter_mm": 0.045, "secondary_insulation_mm": 0.004,
+        "primary_bobbin_diameter_mm": 14.6, "primary_bobbin_length_mm": 25.6, "secondary_bobbin_diameter_mm": 22.8,
+        "secondary_slot_widths_string": "2.8, 2.8, 2.8, 2.8, 2.8, 2.8, 2.8",
+        "core_length_mm": 30.0, "core_area_mm2": 100, "core_mu_r_eff": 19.07,
+        "coupling_factor_k": 0.88, "secondary_packing_factor": 0.85, "secondary_length_buffer": 1.05,
+        "fixed_cutoff_us": 40.0,
+        "applied_core": "SE35S_SE39S_Core", "K_struct": 2.39
+    },
+    "SE39S": {
+        "primary_turns": 250, "primary_cu_diameter_mm": 0.35, "primary_insulation_mm": 0.01,
+        "secondary_turns": 17850, "secondary_cu_diameter_mm": 0.04, "secondary_insulation_mm": 0.003,
+        "primary_bobbin_diameter_mm": 14.0, "primary_bobbin_length_mm": 25.5, "secondary_bobbin_diameter_mm": 20.4,
+        "secondary_slot_widths_string": "2.8, 2.8, 2.8, 2.8, 2.8, 2.8, 2.8",
+        "core_length_mm": 28.95, "core_area_mm2": 100, "core_mu_r_eff": 18.28,
+        "coupling_factor_k": 0.88, "secondary_packing_factor": 0.85, "secondary_length_buffer": 1.05,
+        "fixed_cutoff_us": 40.0,
+        "applied_core": "SE35S_SE39S_Core", "K_struct": 2.31
+    }
+}
+
+# =================================================================
+# 4. 核心輔助邏輯
+# =================================================================
+
+def generate_n2_scan_range(n2):
+    base = int(n2)
+    steps = [base - 3000, base - 2000, base - 1000, base, base + 1000, base + 2000, base + 3000]
+    return ", ".join(map(str, [s for s in steps if s > 0]))
+
+def calculate_mu_r(L_measured_mH, N_turns, core_length_mm, core_area_mm2):
+    # 🔒 [PHYSICS LOCK] 開磁路電感公式: L = (mu0 * mu_r * N^2 * A) / l
+    L_H, l_m, a_m2 = L_measured_mH/1000, core_length_mm/1000, core_area_mm2*1e-6
+    mu_0 = 4 * math.pi * 1e-7
+    try: mu_r = (L_H * l_m) / (mu_0 * a_m2 * N_turns**2)
+    except: return "輸入參數有誤"
+    return f"### **📊 開磁路 μr 反推結果 (Back-Calculation)**\n- **實測 L1 (Measured L1)**：`{L_measured_mH:.2f} mH`\n- **有效導磁率 (Effective μ_r)** ≈ `{mu_r:.2f}`\n\n*(⚠️ 注意：此 L1 應為使用 LCR Meter 在低電流/未飽和狀態下之量測值，以避免雙重計算飽和效應。)*"
+
+def calculate_k_gain(measured_ip, measured_v2_kv, n1, n2, core_type, l_mm, a_mm2, mu_r_eff):
+    """
+    V10.7: 使用實測數據逆向工程 K 值
+    公式逆推: K = V2 / (Ip * sqrt(Leff) * (N2/N1) * Gamma)
+    """
+    mu_0 = 4 * math.pi * 1e-7
+    l_nom = (n1**2) * mu_0 * mu_r_eff * (a_mm2*1e-6) / (l_mm/1000)
+
+    # 計算當前電流下的飽和電感
+    core_char = CORE_DB.get(core_type)
+    mu_scale = np.interp(n1 * measured_ip, core_char["ref_ni"], core_char["ref_mu_scale"])
+    l_eff = l_nom * mu_scale
+
+    # 計算平方根抑制因子 (Gamma)
+    # 🔒 [PHYSICS LOCK] Gamma = sqrt(N_base / N2) - 基於電容能量守恆 V ~ sqrt(1/C) ~ sqrt(1/N)
+    base_n2 = core_char["base_n2"]
+    gamma = math.sqrt(base_n2 / n2)
+
+    try:
+        # 單位轉換: kV -> V
+        k_res = (measured_v2_kv * 1000) / (measured_ip * math.sqrt(l_eff) * (n2/n1) * gamma * 1000)
+    except ZeroDivisionError:
+        return "⚠️ 計算錯誤：電流或電感不能為 0", 3.26
+
+    report = f"### **🎯 K-Struct 自動對齊結果 (Auto-Alignment)**\n- **實測點 (Measured)**：`{measured_ip} A` / `{measured_v2_kv} kV`\n- **飽和電感 (Leff)**：`{l_eff*1000:.3f} mH` (Saturation {mu_scale*100:.1f}%)\n- **抑制係數 (γ)**：`{gamma:.4f}`\n- **建議 K 值 (K_struct)**：`{k_res:.4f}`"
+    return report, round(k_res, 4)
+
+def load_preset_data(m):
+    if m not in PRESETS: return gr.update()
+    d = PRESETS[m]
+    n2_scan = generate_n2_scan_range(d["secondary_turns"])
+    return (
+        d["primary_turns"], d["primary_cu_diameter_mm"], d["primary_insulation_mm"],
+        d["secondary_turns"], d["secondary_cu_diameter_mm"], d["secondary_insulation_mm"],
+        d["primary_bobbin_diameter_mm"], d["primary_bobbin_length_mm"],
+        d["secondary_bobbin_diameter_mm"],
+        d["core_length_mm"], d["core_area_mm2"], d["core_mu_r_eff"],
+        d["secondary_slot_widths_string"],
+        d["coupling_factor_k"], d["secondary_packing_factor"], d["secondary_length_buffer"],
+        d.get("fixed_cutoff_us", 40.0),
+        d["applied_core"], d["K_struct"], n2_scan
+    )
+
+def load_tool3_preset(m):
+    # V11.1 Update: Tool 3 專用的載入函數
+    if m not in PRESETS: return gr.update()
+    d = PRESETS[m]
+    return (
+        d["primary_turns"],
+        d["secondary_turns"],
+        d["applied_core"],
+        d["core_mu_r_eff"],
+        d["core_length_mm"],
+        d["core_area_mm2"]
+    )
+
+def run_simulation(
+    previous_95_time, model_type, core_selection, K_struct, # V11.1: gain_k renamed to K_struct
+    igbt_model, V_in, chargetime_ms, fixed_cutoff_time_us,
+    core_length_mm, core_area_mm2, mu_r_eff,
+    cu_diameter_mm_p, insulation_mm_p, turns_p, bobbin_diameter_mm_p, bobbin_length_mm_p,
+    cu_diameter_mm_s, insulation_mm_s, turns_s, bobbin_diameter_mm_s,
+    slot_widths_mm_s_str, turns_s_range_str,
+    coupling_factor, packing_factor_s, length_buffer_ratio_s,
+    operating_temp
+):
+    # --- 🛡️ 輸入參數檢查 (Input Validation) ---
+    if not (0 < packing_factor_s <= 1.0):
+        return "❌ 參數錯誤 (Error): 二次繞線緊密度 (Packing Factor) 必須在 0 ~ 1 之間 (不包含 0)。", None, previous_95_time
+    if V_in <= 0:
+        return "❌ 參數錯誤 (Error): 輸入電壓 (Input Voltage) 必須大於 0。", None, previous_95_time
+    if chargetime_ms <= 0:
+        return "❌ 參數錯誤 (Error): 充磁時間 (Dwell Time) 必須大於 0。", None, previous_95_time
+    # ----------------------------------------
+
+    core_length_m, core_area_m2 = core_length_mm/1000, core_area_mm2*1e-6
+    chargetime, mu_0 = chargetime_ms/1000, 4*math.pi*1e-7
+    rho_copper = 1.724e-8 * (1 + 0.0039*(operating_temp-20))
+
+    try:
+        slot_widths_mm_s = [float(x.strip()) for x in slot_widths_mm_s_str.split(',') if x.strip()]
+        turns_s_range = [int(x.strip()) for x in turns_s_range_str.split(',') if x.strip()]
+    except: return "參數格式錯誤 (Format Error): 請檢查槽寬或匝數範圍格式 (需用逗號分隔)。", None, previous_95_time
+
+    # 一次側基礎計算
+    total_dia_p = cu_diameter_mm_p + 2*insulation_mm_p
+    turns_per_layer_p = max(1, math.floor(bobbin_length_mm_p / total_dia_p))
+    layers_p = math.ceil(turns_p / turns_per_layer_p)
+    len_p = sum(2*math.pi*((bobbin_diameter_mm_p/2 + total_dia_p*(l+0.5))/1000)*min(turns_per_layer_p, turns_p - l*turns_per_layer_p) for l in range(layers_p))
+    R1 = rho_copper * len_p / (math.pi * ((cu_diameter_mm_p/2)/1000)**2)
+    # 🔒 [PHYSICS LOCK] 開磁路 L1 初始值計算
+    L1 = (turns_p**2)*mu_0*mu_r_eff*core_area_m2/core_length_m
+
+    # IGBT 動態參數 (V10.9 更新: 純物理公式)
+    igbt_base = IGBT_DB.get(igbt_model, IGBT_DB["T121"])
+    v_th_dyn = igbt_base["Vth_base"] + igbt_base["v_slope"] * (V_in - 14.0)
+    r_on_dyn = igbt_base["Ron_base"] + igbt_base["r_slope"] * (V_in - 14.0)
+
+    # RL 模擬迴圈
+    steps = 500; dt = chargetime/steps; t_axis = np.linspace(0, chargetime, steps)
+    I_curve, Vce_curve, current_I = np.zeros(steps), np.zeros(steps), 0.0
+    v_eff_sum = 0
+    for i in range(1, steps):
+        # V10.9 更新: 取消 max(0.5) 限制，回歸純物理公式
+        # 🔒 [PHYSICS LOCK] IGBT Vce = I * Ron + Vth
+        v_drop = current_I * r_on_dyn + v_th_dyn
+        # 為了避免在 I=0 時出現負值或其他異常 (雖然 Vth 通常為正)，加一個非負保護
+        v_drop = max(0, v_drop)
+
+        Vce_curve[i] = v_drop
+        v_eff = max(0, V_in - v_drop)
+        v_eff_sum += v_eff
+        # 🔒 [PHYSICS LOCK] Euler Method: dI/dt = (V - I*R) / L
+        di = (v_eff - current_I*R1)/L1 * dt
+        current_I += di
+        I_curve[i] = max(0, current_I)
+
+    I_peak, Vce_peak = I_curve[-1], Vce_curve[-1]
+    avg_v_eff = v_eff_sum/(steps-1)
+    primary_energy_mj = 0.5*L1*(I_peak**2)*1000
+
+    # 充磁速度分析
+    time_constant_ms = (L1 / R1) * 1000
+    I_limit_theoretical = (V_in - v_th_dyn) / R1
+    i_95_target = I_limit_theoretical * 0.95
+    t_95_ms = time_constant_ms * 3.0
+
+    trend_str = ""
+    if previous_95_time is not None:
+        diff = t_95_ms - previous_95_time
+        if abs(diff) >= 0.01:
+            trend_str = f" ({'⚡ 變快' if diff < 0 else '🐢 變慢'} {abs(diff):.2f} ms)"
+        else:
+            trend_str = " (無變化)"
+
+    # --- [新增邏輯] 計算 NI 與 當前飽和度 ---
+    ni_peak = turns_p * I_peak
+    core_char = CORE_DB.get(core_selection, CORE_DB["J3_Core"])
+    current_mu_scale = np.interp(ni_peak, core_char["ref_ni"], core_char["ref_mu_scale"])
+    # -------------------------------------
+
+    # 二次側計算 (V10.9 更新: 導入層疊繞線計算邏輯)
+    def calc_sec(N2_in):
+        wire_full_dia_s = cu_diameter_mm_s + 2*insulation_mm_s
+        total_width = sum(slot_widths_mm_s)
+
+        # 分配匝數到各槽
+        turns_per_slot = [math.floor(N2_in*(w/total_width)) for w in slot_widths_mm_s]
+        turns_per_slot[-1] += N2_in - sum(turns_per_slot)
+
+        len_s_total = 0
+        max_h_accum = 0 # 用於追蹤最大堆疊高度以計算 OD
+
+        for i, ns in enumerate(turns_per_slot):
+            slot_w = slot_widths_mm_s[i]
+            turns_per_layer = max(1, math.floor(slot_w / wire_full_dia_s))
+            # 計算該槽需要的層數
+            layers_in_slot = math.ceil(ns / turns_per_layer)
+
+            # 逐層計算線長 (Layered Winding Calculation)
+            # 第0層直徑 = 線輪架OD + 線徑(考慮緊密度)
+            # 第k層直徑 = 線輪架OD + 2 * (k * 線徑)
+            for lay in range(layers_in_slot):
+                # 該層的等效直徑
+                layer_dia = bobbin_diameter_mm_s + 2 * (lay * wire_full_dia_s / packing_factor_s)
+                # 該層的匝數 (除了最後一層可能不滿，其他層都是 turns_per_layer)
+                t_in_this_layer = min(turns_per_layer, ns - lay * turns_per_layer)
+
+                len_s_total += t_in_this_layer * math.pi * (layer_dia / 1000)
+
+            # 計算該槽的堆疊高度 (用於推算 OD)
+            h_slot = (layers_in_slot * wire_full_dia_s) / packing_factor_s
+            if h_slot > max_h_accum:
+                max_h_accum = h_slot
+
+        # 計算 R2
+        R2 = rho_copper * len_s_total * length_buffer_ratio_s / (math.pi*((cu_diameter_mm_s/2)/1000)**2)
+        # 計算 OD (線輪架直徑 + 2倍的最大繞線高度)
+        estimated_OD = bobbin_diameter_mm_s + 2 * max_h_accum
+
+        L2_nom = (N2_in**2)*mu_0*mu_r_eff*core_area_m2/core_length_m
+
+        if model_type == "磁飽和模擬 (Magnetic Saturation)":
+            # 這裡計算 V2 時也使用一樣的飽和曲線邏輯
+            mu_scale = np.interp(turns_p*I_peak, core_char["ref_ni"], core_char["ref_mu_scale"])
+            # 🔒 [PHYSICS LOCK] 有效電感飽和修正
+            L1_eff = L1 * mu_scale
+            # 使用 Gamma 抑制係數
+            base_n2 = core_char["base_n2"]
+            # 🔒 [PHYSICS LOCK] Gamma 係數: 反映雜散電容隨匝數增加
+            gamma = math.sqrt(base_n2 / N2_in)
+            # 🔒 [PHYSICS LOCK] 能量守恆與結構係數 V2 ~ I * sqrt(L) * Gamma * K
+            V2 = I_peak * math.sqrt(L1_eff) * (N2_in / turns_p) * gamma * K_struct * 1000 
+            note = f" (L1_eff={L1_eff*1000:.2f}mH, Saturation={mu_scale*100:.1f}%)"
+        else:
+            V2 = (coupling_factor * math.sqrt(L1 * L2_nom)) * (I_peak / (fixed_cutoff_time_us / 1e6))
+            note = ""
+        return R2, L2_nom, V2, estimated_OD, note
+
+    # --- 報告生成 ---
+    output = io.StringIO(); p = lambda t: print(t, file=output)
+
+    p(f"### **環境與模式參數 (Environment)**")
+    p(f"- **計算模型 (Model)**：`{model_type}`")
+    p(f"- **IGBT 型號**：`{igbt_model}` (動態參數偏移已啟用)")
+    p(f"- **輸入電壓降 (Vce)**：`{Vce_peak:.2f} V`")
+
+    p(f"\n### **一次側特性 (Primary)**")
+    p(f"- **一次電阻 (R1)**：`{R1:.3f} Ω`")
+    p(f"- **一次電感 (L1)**：`{L1 * 1000:.3f} mH`")
+    p(f"- **充磁時間最大電流 (Ip)**：`{I_peak:.3f} A`")
+
+    p(f"\n### **RL 充磁速度分析 (RL Charging Speed)**")
+    p(f"*(ℹ️ 備註：電感越大，電流爬升越慢 / Higher Inductance = Slower Rise)*")
+    p(f"- **極限電流**：`{I_limit_theoretical:.3f} A` (當時間無限長時)")
+    p(f"- **95% 電流 ({i_95_target:.2f}A) 需**：`{t_95_ms:.2f} ms` {trend_str}")
+    p(f"- **初級儲存能量 (Primary Energy)**：`{primary_energy_mj:.2f} mJ`")
+    p(f"- **時間常數 (Time Const τ)**：`{time_constant_ms:.2f} ms`")
+    p(f"- **安匝數 (NI)**：`{ni_peak:.1f} AT`")
+    p(f"- **有效導磁能力 (μ_scale)**：`{current_mu_scale * 100:.1f}%`")
+    p(f"\n> 當導磁能力掉到 **60%~70%** 以下，代表鐵芯已接近磁通極限，增加充磁時間對提升電壓的邊際效益將顯著下降。")
+
+    main_res = calc_sec(turns_s)
+    if main_res:
+        p(f"\n### **二次側特性 (Secondary, N={turns_s})**")
+        p(f"- **二次電阻 (R2)**：`{main_res[0]/1000:.2f} kΩ`")
+        p(f"- **二次電感 (L2)**：`{main_res[1]:.3f} H`")
+        p(f"- **二次電壓 (V2)**：`{abs(main_res[2])/1000:.2f} kV`")
+        p(f"- **預估外徑 (OD)**：`{main_res[3]:.2f} mm`")
+
+    if turns_s_range:
+        p("\n### **📊 二次側匝數掃描 (Sensitivity Scan)**")
+        tbl = [[t, f"{r[0]/1000:.2f}", f"{r[1]:.3f}", f"{abs(r[2])/1000:.2f}", f"{r[3]:.2f}"] for t in turns_s_range if (r := calc_sec(t))]
+        p(tabulate(tbl, headers=["N", "R2(kΩ)", "L2(H)", "V2(kV)", "OD(mm)"], tablefmt="pipe", stralign="center"))
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    ax1.plot(t_axis*1000, I_curve, color='tab:blue', linewidth=2); ax1.set_ylabel('Current (A)'); ax1.grid(True, alpha=0.3); ax1.set_title("Primary Current Rise")
+    ax1.scatter(chargetime*1000, I_peak, color='blue', zorder=5); ax1.text(chargetime*1000, I_peak, f" {I_peak:.2f}A", color='blue', fontweight='bold', va='bottom')
+
+    ax2.plot(t_axis*1000, np.full(steps, V_in), color='gold', linewidth=2, label=f"Input ({V_in}V)")
+    ax2.plot(t_axis*1000, Vce_curve, color='#ff00ff', linewidth=2, label="Vce Dynamic Drop")
+    ax2.fill_between(t_axis*1000, Vce_curve, V_in, color='green', alpha=0.1, label="Effective Veff")
+    ax2.set_ylabel("Voltage (V)"); ax2.set_xlabel("Time (ms)"); ax2.legend(loc='upper right'); ax2.grid(True, alpha=0.3)
+    ax2.set_ylim(0, V_in + 2)
+    plt.tight_layout()
+    return output.getvalue(), fig, t_95_ms
+
+# =================================================================
+# 5. GUI 介面設定
+# =================================================================
+
+with gr.Blocks(title="Ignition Coil V11.0") as demo:
+    gr.Markdown("# ⚡ Ignition Coil Designer (V11.0)")
+
+    with gr.Accordion("📘 物理模型與備註 (Physics Model Formulas)", open=False):
+        gr.Markdown(r"""
+        **A. 一次側 RL 暫態響應 (Primary RL Response)**
+        $$I(t) = \frac{V_{eff}}{R}(1 - e^{-(R/L)t})$$
+        其中 **Vce** 隨 **Vin** 與電流動態偏移：
+        $$V_{ce} = I \cdot R_{on}(V_{in}) + V_{th}(V_{in})$$
+
+        **B. 磁飽和模擬 (Magnetic Saturation)**
+        $$V_2 = I_p \times \sqrt{L_{eff}} \times \frac{N_2}{N_1} \times \gamma \times K$$
+        * **Leff (Effective Inductance)**：隨安培匝數 (**N · I**) 增加，鐵芯進入飽和區導致導磁率下降後的實際電感值。
+        * **K (K_struct)**：結構綜合係數，打包了幾何磁耦合效率與基準雜散電容。
+
+        **C. 電容抑制係數 (Capacitive Suppression Factor γ)**
+        $$\gamma = \sqrt{\frac{N_{2,base}}{N_2}}$$
+        * **γ** 代表因匝數增加導致雜散電容 (**Cs**) 變大，進而抑制電壓爬升幅度的物理現象。
+        * **線輪架 (Bobbin)**：線輪架的直徑與長度直接影響雜散電容的大小。
+        """)
+
+    state_last_95_time = gr.State(value=None)
+
+    with gr.Tabs():
+        with gr.TabItem("1. Performance Simulation"):
+            preset_dropdown = gr.Dropdown(list(PRESETS.keys()), label="📁 選擇機種 (Select Model)", value="J3")
+            with gr.Row(variant="panel"):
+                model_type = gr.Radio(["標準線性模型 (Standard)", "磁飽和模擬 (Magnetic Saturation)"], label="📐 計算模型 (Calculation Model)", value="磁飽和模擬 (Magnetic Saturation)")
+                core_select = gr.Dropdown(list(CORE_DB.keys()), label="🧲 選擇鐵芯特性 (Core Material)", value="J3_Core", info="不同鐵芯材質決定了飽和膝點 (Knee Point)")
+                igbt_model = gr.Dropdown(list(IGBT_DB.keys()), label="🔥 選擇 IGBT 型號 (Select IGBT)", value="T121")
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### 🟢 一次側 (Primary)")
+                    V_in = gr.Number(14, label="輸入電壓 (Input Voltage) [V]")
+                    chargetime_ms = gr.Number(2.5, label="充磁時間 (Dwell Time) [ms]")
+                    turns_p = gr.Number(280, label="一次側匝數 (Primary Turns N1)")
+                    cu_diameter_mm_p = gr.Number(0.35, label="一次裸銅線徑 (Primary Wire Φ) [mm]")
+                    operating_temp = gr.Number(25, label="工作溫度 (Operating Temp) [°C]")
+                with gr.Column():
+                    gr.Markdown("### 🔴 二次側 (Secondary)")
+                    turns_s = gr.Number(13012, label="二次側匝數 (Secondary Turns N2)")
+                    cu_diameter_mm_s = gr.Number(0.05, label="二次裸銅線徑 (Secondary Wire Φ) [mm]", info="常用 (Common): 0.040/0.003, 0.045/0.004")
+                    turns_s_range = gr.Textbox("10012, 11012, 12012, 13012, 14012, 15012, 16012", label="N2 掃描範圍 (Turns Scan Range)")
+
+            with gr.Accordion("⚙️ 進階參數 (Advanced Params)", open=False):
+                with gr.Row():
+                    # V11.1 Update: Renamed component to K_struct
+                    K_struct = gr.Number(3.26, label="結構綜合係數 (K_struct)", info="磁飽和模型專用。")
+                    fixed_cutoff_time_us = gr.Number(25, label="固定切斷時間 (Fixed Cutoff) [µs]", info="標準線性模型使用。")
+                    coupling_factor = gr.Number(0.95, label="耦合係數 (Coupling k)", info="標準線性模型使用。")
+                with gr.Row():
+                    packing_factor_s = gr.Number(0.85, label="二次繞線緊密度 (Packing Factor)", info="數值越小外徑越大 (Lower value = Larger OD)"); length_buffer_ratio_s = gr.Number(1.05, label="二次線長補正係數 (Length Buffer)")
+                with gr.Row():
+                    bobbin_diameter_mm_p = gr.Number(14.6, label="一次線輪架外徑 (Pri. Bobbin OD) [mm]")
+                    bobbin_length_mm_p = gr.Number(25.6, label="一次線輪架長度 (Pri. Bobbin Len) [mm]")
+                    bobbin_diameter_mm_s = gr.Number(22.8, label="二次線輪架外徑 (Sec. Bobbin OD) [mm]")
+                    core_length_mm = gr.Number(30.0, label="磁路長度 (Magnetic Path Length) [mm]")
+                    core_area_mm2 = gr.Number(80, label="鐵芯面積 (Core Area) [mm²]")
+                    mu_r_eff = gr.Number(20.93, label="有效導磁率 (Effective μr)")
+                    insulation_mm_p = gr.Number(0.01, label="一次絕緣層 (Pri. Insulation) [mm]")
+                    insulation_mm_s = gr.Number(0.004, label="二次絕緣層 (Sec. Insulation) [mm]")
+                    slot_widths_mm_s = gr.Textbox("1.0, 1.0, 2.4, 2.4, 2.4, 2.4, 2.4, 2.4, 2.4, 1.0", label="二次側槽寬 (Sec. Slot Widths) [mm]")
+
+            btn = gr.Button("🚀 執行模擬 (Run Simulation)", variant="primary")
+            report_out, plot_out = gr.Markdown(), gr.Plot()
+
+            btn.click(run_simulation, inputs=[state_last_95_time, model_type, core_select, K_struct, igbt_model, V_in, chargetime_ms, fixed_cutoff_time_us, core_length_mm, core_area_mm2, mu_r_eff, cu_diameter_mm_p, insulation_mm_p, turns_p, bobbin_diameter_mm_p, bobbin_length_mm_p, cu_diameter_mm_s, insulation_mm_s, turns_s, bobbin_diameter_mm_s, slot_widths_mm_s, turns_s_range, coupling_factor, packing_factor_s, length_buffer_ratio_s, operating_temp], outputs=[report_out, plot_out, state_last_95_time])
+            turns_s.change(lambda v: generate_n2_scan_range(v), inputs=[turns_s], outputs=[turns_s_range])
+            preset_dropdown.change(load_preset_data, preset_dropdown, [turns_p, cu_diameter_mm_p, insulation_mm_p, turns_s, cu_diameter_mm_s, insulation_mm_s, bobbin_diameter_mm_p, bobbin_length_mm_p, bobbin_diameter_mm_s, core_length_mm, core_area_mm2, mu_r_eff, slot_widths_mm_s, coupling_factor, packing_factor_s, length_buffer_ratio_s, fixed_cutoff_time_us, core_select, K_struct, turns_s_range])
+
+        with gr.TabItem("2. μr Back-Calculation"):
+            with gr.Row():
+                t1_L = gr.Number(label="實測 L1 (Measured L1) [mH]", value=5.5)
+                t1_N = gr.Number(label="N1 匝數 (Turns)", value=280)
+                t1_len = gr.Number(label="磁路長度 (Magnetic Path Length) [mm]", value=30.0)
+                t1_area = gr.Number(label="鐵芯面積 (Core Area) [mm²]", value=80.0)
+                btn_calc, t1_output = gr.Button("執行反推 (Calculate)", variant="primary"), gr.Markdown()
+            btn_calc.click(calculate_mu_r, [t1_L, t1_N, t1_len, t1_area], t1_output)
+
+        with gr.TabItem("3. K-Gain Auto-Alignment (對齊工具)"):
+            gr.Markdown("### 🎯 使用實測數據反推結構 K 係數 (Back-calculate Structure K)")
+            # --- 新增/修改的說明備註 ---
+            gr.Markdown("""
+            **💡 數據選擇建議 (Best Practice):**
+            * **請輸入「工作點」的實測數據**：建議使用接近飽和區的電流值 (例如 Ip = 3.0A ~ 3.5A)。
+            * **原因**：在高電流下對齊 K 值，可以自動補償鐵芯飽和曲線的微小誤差，確保模擬器在最大能量輸出的預測最為精準。
+            * *若使用低電流 (如 0.5A) 數據，雖符合線性物理，但可能導致高電流飽和時的電壓預測偏低。*
+            """)
+            # ---------------------------
+            
+            # V11.1 Update: 新增 Tool 3 機種預設載入功能
+            t3_preset_dropdown = gr.Dropdown(list(PRESETS.keys()), label="📁 載入幾何預設值 (Load Geometry Preset)", value="J3")
+            
+            with gr.Row():
+                with gr.Column():
+                    m_ip = gr.Number(label="實測峰值電流 (Measured Ip) [A]", value=3.5)
+                    m_v2 = gr.Number(label="實測二次電壓 (Measured V2) [kV]", value=32.6)
+                with gr.Column():
+                    m_n1 = gr.Number(label="一次匝數 (N1 Turns)", value=280)
+                    m_n2 = gr.Number(label="二次匝數 (N2 Turns)", value=13012)
+            with gr.Row():
+                m_core = gr.Dropdown(list(CORE_DB.keys()), label="套用鐵芯飽和曲線 (Apply Core Curve)", value="J3_Core")
+                m_mur = gr.Number(label="當前有效 μr (Current μr)", value=20.93)
+                m_l = gr.Number(label="磁路長度 (Magnetic Path Length) [mm]", value=30.0)
+                m_a = gr.Number(label="鐵芯面積 (Core Area) [mm²]", value=80.0)
+            btn_align = gr.Button("🚀 計算 K 係數並套用至模擬器 (Calculate & Apply)", variant="primary")
+            align_report = gr.Markdown()
+
+            # 對齊邏輯連動：計算完成後，自動更新 Tab 1 的 K_struct
+            btn_align.click(calculate_k_gain, [m_ip, m_v2, m_n1, m_n2, m_core, m_l, m_a, m_mur], [align_report, K_struct])
+            # V11.1 Update: Tool 3 載入連動
+            t3_preset_dropdown.change(load_tool3_preset, t3_preset_dropdown, [m_n1, m_n2, m_core, m_mur, m_l, m_a])
+
+if __name__ == "__main__":
+    demo.launch()
