@@ -1,0 +1,37 @@
+name: Backup HF Space to CoilProject
+
+# 把 Hugging Face Space finemtt1/Ignition-Coil-Simulation 目前的檔案抓回 CoilProject/。
+# Space 是公開的，不需要任何 token。
+on:
+  workflow_dispatch:
+  push:
+    branches: [claude/focused-archimedes-ye7l94]
+
+permissions:
+  contents: write
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync files from the Space
+        run: python3 deploy/sync_from_space.py
+
+      - name: Show what changed
+        run: |
+          git status --short CoilProject
+          git --no-pager diff --stat CoilProject
+
+      - name: Commit and push if anything changed
+        run: |
+          if git diff --quiet -- CoilProject; then
+            echo "CoilProject already matches the Space. Nothing to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CoilProject
+          git commit -m "Sync final files from HF Space (automated backup)"
+          git push
